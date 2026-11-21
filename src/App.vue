@@ -1,26 +1,51 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import { recipes } from './data/recipes.js'
+import {
+  getTheMealDbAreas,
+  getTheMealDbRecipeDetails,
+  searchTheMealDbRecipes,
+} from './services/themealdb.js'
 
-const cuisineOptions = ['All cuisines', ...new Set(recipes.map((recipe) => recipe.cuisine))]
-const dietaryOptions = ['Anything', 'Vegan', 'Vegetarian', 'Gluten-free']
+const cuisineOptions = ref([
+  'All cuisines',
+  ...new Set(recipes.map((recipe) => recipe.cuisine)),
+])
+const standardDietaryOptions = ['Anything', 'Vegan', 'Vegetarian']
+const dietaryOptions = computed(() =>
+  isUsingSampleRecipes.value
+    ? [...standardDietaryOptions, 'Gluten-free']
+    : standardDietaryOptions
+)
 
-const cuisineFilter = ref(cuisineOptions[0])
-const dietaryFilter = ref(dietaryOptions[0])
+const cuisineFilter = ref('All cuisines')
+const dietaryFilter = ref('Anything')
+const searchTerm = ref('')
+const activeSearchTerm = ref('')
 const currentView = ref('discover')
 const currentRecipe = ref(null)
+const availableRecipes = ref(recipes)
 const likedRecipes = ref([])
 const dislikedIds = ref([])
 const seenIds = ref([])
 const detailsRecipe = ref(null)
+const detailsLoading = ref(false)
+const detailsError = ref('')
+const isLoadingRecipes = ref(false)
+const isUsingSampleRecipes = ref(false)
+const searchNotice = ref('')
+const apiError = ref('')
 const feedback = ref('')
+let searchController
+let searchRequestId = 0
+let detailsController
+let detailsRequestId = 0
+let areasLoaded = false
 const fallbackRecipeImage = `data:image/svg+xml,${encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500"><defs><linearGradient id="a" x2="1" y2="1"><stop stop-color="#e8eee7"/><stop offset="1" stop-color="#d4dfd0"/></linearGradient></defs><rect width="800" height="500" fill="url(#a)"/><circle cx="400" cy="235" r="130" fill="#fffefa" opacity=".8"/><circle cx="400" cy="235" r="98" fill="#d9e3d4"/><path d="M347 230c25-46 78-48 109-5-8 43-45 69-87 56-23-8-34-27-22-51Z" fill="#96ad84"/><circle cx="370" cy="222" r="13" fill="#cf8d67"/><circle cx="420" cy="253" r="12" fill="#d1a256"/><path d="M400 80v35m0 240v35M245 235h35m240 0h35" stroke="#77916f" stroke-width="8" stroke-linecap="round" opacity=".65"/></svg>'
 )}`
 
-const matchingRecipeCount = computed(() =>
-  recipes.filter((recipe) => matchesPreferences(recipe)).length
-)
+const matchingRecipeCount = computed(() => availableRecipes.value.length)
 
 const likedRecipeIds = computed(() => likedRecipes.value.map((recipe) => recipe.id))
 
@@ -30,23 +55,38 @@ const recommendationsLearned = computed(() =>
     : 'Like a recipe and we’ll use it to shape your next picks.'
 )
 
-function matchesPreferences(recipe) {
+function matchesPreferences(recipe, query = '') {
   const matchesCuisine =
     cuisineFilter.value === 'All cuisines' || recipe.cuisine === cuisineFilter.value
   const matchesDiet =
     dietaryFilter.value === 'Anything' || recipe.dietary.includes(dietaryFilter.value)
+  const searchText = [
+    recipe.name,
+    recipe.cuisine,
+    recipe.description,
+    ...recipe.dietary,
+    ...recipe.tags,
+    ...recipe.ingredients,
+  ]
+    .join(' ')
+    .toLowerCase()
+  const matchesSearch = !query || searchText.includes(query.toLowerCase())
 
-  return matchesCuisine && matchesDiet
+  return matchesCuisine && matchesDiet && matchesSearch
 }
 
 function getRecommendationScore(recipe) {
-  const likedTags = likedRecipes.value.flatMap((likedRecipe) => likedRecipe.tags)
+  const likedTags = likedRecipes.value.flatMap((likedRecipe) => likedRecipe.tags ?? [])
   const sharedTagScore = likedTags.filter((tag) => recipe.tags.includes(tag)).length
   const sharedCuisineScore = likedRecipes.value.filter(
     (likedRecipe) => likedRecipe.cuisine === recipe.cuisine
   ).length
 
   return sharedTagScore + sharedCuisineScore * 2
+}
+
+function getLocalRecipes(query) {
+  return recipes.filter((recipe) => matchesPreferences(recipe, query))
 }
 
 function pickNextRecipe() {
@@ -56,9 +96,8 @@ function pickNextRecipe() {
     seenIds.value.push(previousRecipe.id)
   }
 
-  const candidates = recipes.filter(
+  const candidates = availableRecipes.value.filter(
     (recipe) =>
-      matchesPreferences(recipe) &&
       !dislikedIds.value.includes(recipe.id) &&
       !likedRecipeIds.value.includes(recipe.id) &&
       !seenIds.value.includes(recipe.id)
@@ -78,6 +117,77 @@ function pickNextRecipe() {
 
   currentRecipe.value = bestMatches[nextIndex]
   feedback.value = ''
+}
+
+async function searchRecipes() {
+  const requestId = ++searchRequestId
+  searchController?.abort()
+  currentRecipe.value = null
+  seenIds.value = []
+  feedback.value = ''
+  apiError.value = ''
+  activeSearchTerm.value = searchTerm.value.trim()
+
+  if (dietaryFilter.value === 'Gluten-free') {
+    isLoadingRecipes.value = false
+    isUsingSampleRecipes.value = true
+    availableRecipes.value = getLocalRecipes(activeSearchTerm.value)
+    searchNotice.value =
+      'TheMealDB does not provide a reliable gluten-free filter. Showing sample recipes; check every ingredient.'
+    pickNextRecipe()
+    return
+  }
+
+  const controller = new AbortController()
+  searchController = controller
+  isLoadingRecipes.value = true
+  searchNotice.value = ''
+
+  try {
+    const results = await searchTheMealDbRecipes({
+      query: activeSearchTerm.value,
+      cuisine: cuisineFilter.value,
+      diet: dietaryFilter.value,
+      signal: controller.signal,
+    })
+
+    if (requestId !== searchRequestId) return
+
+    availableRecipes.value = results
+    isUsingSampleRecipes.value = false
+    searchNotice.value = ''
+    if (results.length === 0) {
+      currentRecipe.value = null
+      feedback.value = ''
+    } else {
+      pickNextRecipe()
+    }
+
+    if (!areasLoaded) {
+      try {
+        const areas = await getTheMealDbAreas(controller.signal)
+        if (requestId === searchRequestId) {
+          cuisineOptions.value = ['All cuisines', ...areas]
+          areasLoaded = true
+        }
+      } catch (error) {
+        if (!controller.signal.aborted && requestId === searchRequestId) {
+          searchNotice.value = `Cuisine options could not be loaded: ${error.message}`
+        }
+      }
+    }
+  } catch (error) {
+    if (controller.signal.aborted || requestId !== searchRequestId) return
+
+    availableRecipes.value = getLocalRecipes(activeSearchTerm.value)
+    isUsingSampleRecipes.value = true
+    apiError.value = `Could not load TheMealDB recipes: ${error.message} Showing matching sample recipes instead.`
+    pickNextRecipe()
+  } finally {
+    if (requestId === searchRequestId) {
+      isLoadingRecipes.value = false
+    }
+  }
 }
 
 function likeCurrentRecipe() {
@@ -105,12 +215,46 @@ function resetSuggestions() {
   pickNextRecipe()
 }
 
+function clearKeywordSearch() {
+  searchTerm.value = ''
+  searchRecipes()
+}
+
 function removeLikedRecipe(recipeId) {
   likedRecipes.value = likedRecipes.value.filter((recipe) => recipe.id !== recipeId)
 }
 
-function openRecipeDetails(recipe) {
+async function openRecipeDetails(recipe) {
+  detailsController?.abort()
   detailsRecipe.value = recipe
+  detailsError.value = ''
+  detailsLoading.value = false
+
+  if (recipe.source !== 'themealdb' || !recipe.themealdbId) return
+
+  const requestId = ++detailsRequestId
+  const controller = new AbortController()
+  detailsController = controller
+  detailsLoading.value = true
+
+  try {
+    const fullRecipe = await getTheMealDbRecipeDetails({
+      recipeId: recipe.themealdbId,
+      signal: controller.signal,
+    })
+
+    if (requestId === detailsRequestId) {
+      detailsRecipe.value = { ...recipe, ...fullRecipe }
+    }
+  } catch (error) {
+    if (controller.signal.aborted || requestId !== detailsRequestId) return
+
+    detailsError.value = `Could not load full recipe details: ${error.message}`
+  } finally {
+    if (requestId === detailsRequestId) {
+      detailsLoading.value = false
+    }
+  }
 }
 
 function handleRecipeImageError(event) {
@@ -120,16 +264,16 @@ function handleRecipeImageError(event) {
 }
 
 function closeRecipeDetails() {
+  detailsRequestId += 1
+  detailsController?.abort()
+  detailsController = undefined
+  detailsLoading.value = false
   detailsRecipe.value = null
 }
 
-watch([cuisineFilter, dietaryFilter], () => {
-  seenIds.value = []
-  currentRecipe.value = null
-  pickNextRecipe()
-})
+watch([cuisineFilter, dietaryFilter], searchRecipes)
 
-pickNextRecipe()
+searchRecipes()
 </script>
 
 <template>
@@ -190,7 +334,15 @@ pickNextRecipe()
                 <h2 id="today-heading">A pick for you</h2>
               </div>
               <span class="recipe-count">
-                {{ currentRecipe ? `${seenIds.length + 1} / ${matchingRecipeCount}` : 'ALL CAUGHT UP' }}
+                {{
+                  isLoadingRecipes
+                    ? 'SEARCHING'
+                    : currentRecipe
+                      ? `${seenIds.length + 1} / ${matchingRecipeCount}`
+                      : availableRecipes.length === 0
+                        ? 'NO MATCHES'
+                        : 'ALL CAUGHT UP'
+                }}
               </span>
             </div>
 
@@ -199,7 +351,7 @@ pickNextRecipe()
                 <img
                   :key="currentRecipe.id"
                   class="recipe-photo"
-                  :src="currentRecipe.image"
+                  :src="currentRecipe.image || fallbackRecipeImage"
                   :alt="currentRecipe.imageAlt"
                   fetchpriority="high"
                   @error="handleRecipeImageError"
@@ -209,17 +361,19 @@ pickNextRecipe()
                   <svg viewBox="0 0 16 16" aria-hidden="true">
                     <path d="M8 1.5 9.7 6.3 14.5 8l-4.8 1.7L8 14.5l-1.7-4.8L1.5 8l4.8-1.7L8 1.5Z" fill="currentColor" />
                   </svg>
-                  A fresh idea
+                  {{ isUsingSampleRecipes ? 'A fresh idea' : 'TheMealDB recipe' }}
                 </span>
-                <span class="photo-time">{{ currentRecipe.time }} min</span>
+                <span class="photo-time">
+                  {{ currentRecipe.time ? `${currentRecipe.time} min` : 'Recipe idea' }}
+                </span>
               </div>
 
               <div class="recipe-content">
                 <div class="recipe-meta">
                   <span>{{ currentRecipe.cuisine }}</span>
                   <span class="meta-separator"></span>
-                  <span>{{ currentRecipe.difficulty }}</span>
-                  <span class="rating">
+                  <span>{{ currentRecipe.category || currentRecipe.difficulty || 'Recipe' }}</span>
+                  <span v-if="currentRecipe.rating" class="rating">
                     <svg viewBox="0 0 16 16" aria-hidden="true">
                       <path d="m8 1 2.1 4.3 4.7.7-3.4 3.3.8 4.7L8 11.8l-4.2 2.2.8-4.7L1.2 6l4.7-.7L8 1Z" fill="currentColor" />
                     </svg>
@@ -232,7 +386,9 @@ pickNextRecipe()
 
                 <div class="tag-list" aria-label="Recipe tags">
                   <span v-for="tag in currentRecipe.dietary" :key="tag" class="diet-tag">{{ tag }}</span>
-                  <span class="diet-tag">{{ currentRecipe.calories }} cal</span>
+                  <span v-if="currentRecipe.calories" class="diet-tag">
+                    {{ currentRecipe.calories }} cal
+                  </span>
                 </div>
 
                 <div class="recipe-actions">
@@ -263,6 +419,28 @@ pickNextRecipe()
               </div>
             </article>
 
+            <div v-else-if="isLoadingRecipes" class="empty-state" role="status">
+              <span class="empty-illustration" aria-hidden="true">✳</span>
+              <p class="eyebrow">A MOMENT, PLEASE</p>
+              <h3>Finding something delicious.</h3>
+              <p>We’re looking for recipes that match your search.</p>
+            </div>
+
+            <div v-else-if="availableRecipes.length === 0" class="empty-state">
+              <span class="empty-illustration" aria-hidden="true">⌕</span>
+              <p class="eyebrow">NO MATCHES JUST YET</p>
+              <h3>Nothing on the menu.</h3>
+              <p>Try another keyword or adjust your cuisine and dietary preferences.</p>
+              <button
+                v-if="activeSearchTerm"
+                class="button button-primary"
+                type="button"
+                @click="clearKeywordSearch"
+              >
+                Clear keyword
+              </button>
+            </div>
+
             <div v-else class="empty-state">
               <span class="empty-illustration" aria-hidden="true">✳</span>
               <p class="eyebrow">THAT’S A WRAP</p>
@@ -273,6 +451,8 @@ pickNextRecipe()
               </button>
             </div>
 
+            <p v-if="apiError" class="api-feedback api-error" role="alert">{{ apiError }}</p>
+            <p v-else-if="searchNotice" class="api-feedback" role="status">{{ searchNotice }}</p>
             <p class="feedback-message" aria-live="polite">{{ feedback }}</p>
           </section>
 
@@ -289,6 +469,23 @@ pickNextRecipe()
                   <p>A few little preferences</p>
                 </div>
               </div>
+
+              <form class="keyword-search" role="search" @submit.prevent="searchRecipes">
+                <label class="filter-label" for="recipe-search">Search recipes</label>
+                <div class="keyword-input-row">
+                  <input
+                    id="recipe-search"
+                    v-model="searchTerm"
+                    type="search"
+                    name="query"
+                    placeholder="Try “burger” or “Mexican”"
+                    autocomplete="off"
+                  />
+                  <button class="button button-primary search-button" type="submit" :disabled="isLoadingRecipes">
+                    Search
+                  </button>
+                </div>
+              </form>
 
               <label class="filter-label" for="cuisine-filter">Cuisine</label>
               <div class="select-wrap">
@@ -343,14 +540,16 @@ pickNextRecipe()
                   <button class="liked-recipe-link" type="button" @click="openRecipeDetails(recipe)">
                     <img
                       :key="recipe.id"
-                      :src="recipe.image"
+                      :src="recipe.image || fallbackRecipeImage"
                       :alt="recipe.imageAlt"
                       loading="lazy"
                       @error="handleRecipeImageError"
                     />
                     <span class="liked-item-copy">
                       <strong>{{ recipe.name }}</strong>
-                      <small>{{ recipe.cuisine }} · {{ recipe.time }} min</small>
+                      <small>
+                        {{ recipe.cuisine }}<template v-if="recipe.time"> · {{ recipe.time }} min</template>
+                      </small>
                     </span>
                   </button>
                   <button
@@ -392,15 +591,20 @@ pickNextRecipe()
             <button class="saved-image-button" type="button" @click="openRecipeDetails(recipe)">
               <img
                 :key="recipe.id"
-                :src="recipe.image"
+                :src="recipe.image || fallbackRecipeImage"
                 :alt="recipe.imageAlt"
                 loading="lazy"
                 @error="handleRecipeImageError"
               />
-              <span class="saved-time">{{ recipe.time }} min</span>
+              <span class="saved-time">
+                {{ recipe.time ? `${recipe.time} min` : 'Recipe idea' }}
+              </span>
             </button>
             <div class="saved-recipe-copy">
-              <p class="recipe-meta">{{ recipe.cuisine }} <span class="meta-separator"></span> {{ recipe.difficulty }}</p>
+              <p class="recipe-meta">
+                {{ recipe.cuisine }} <span class="meta-separator"></span>
+                {{ recipe.category || recipe.difficulty || 'Recipe' }}
+              </p>
               <h2>{{ recipe.name }}</h2>
               <p>{{ recipe.description }}</p>
               <div class="saved-card-actions">
@@ -427,7 +631,14 @@ pickNextRecipe()
     <footer class="site-footer">
       <a class="footer-brand" href="#" @click.prevent="currentView = 'discover'">savor<span>.</span></a>
       <p>Made for good food and good days.</p>
-      <span class="footer-built">A little inspiration, just for you</span>
+      <a
+        class="footer-built"
+        href="https://www.themealdb.com/"
+        target="_blank"
+        rel="noreferrer"
+      >
+        Recipe data and images by TheMealDB
+      </a>
     </footer>
 
     <Transition name="fade">
@@ -452,7 +663,7 @@ pickNextRecipe()
           <div class="modal-photo-wrap">
             <img
               :key="detailsRecipe.id"
-              :src="detailsRecipe.image"
+              :src="detailsRecipe.image || fallbackRecipeImage"
               :alt="detailsRecipe.imageAlt"
               fetchpriority="high"
               @error="handleRecipeImageError"
@@ -462,34 +673,53 @@ pickNextRecipe()
               <p class="eyebrow">LET’S MAKE SOMETHING GOOD</p>
               <h2>{{ detailsRecipe.name }}</h2>
               <p>{{ detailsRecipe.description }}</p>
+              <a
+                v-if="detailsRecipe.sourceUrl"
+                class="meal-source-link"
+                :href="detailsRecipe.sourceUrl"
+                target="_blank"
+                rel="noreferrer"
+              >
+                View recipe on TheMealDB
+              </a>
             </div>
           </div>
           <div class="modal-meta">
-            <span><strong>{{ detailsRecipe.time }}</strong> min</span>
-            <span><strong>{{ detailsRecipe.servings }}</strong> servings</span>
-            <span><strong>{{ detailsRecipe.calories }}</strong> cal / serving</span>
+            <span v-if="detailsRecipe.time"><strong>{{ detailsRecipe.time }}</strong> min</span>
+            <span v-if="detailsRecipe.servings">
+              <strong>{{ detailsRecipe.servings }}</strong> servings
+            </span>
+            <span v-if="detailsRecipe.calories">
+              <strong>{{ detailsRecipe.calories }}</strong> cal / serving
+            </span>
             <span>{{ detailsRecipe.difficulty }}</span>
           </div>
-          <div class="recipe-details-body">
+          <p v-if="detailsLoading" class="modal-status" role="status">
+            Loading ingredients and instructions…
+          </p>
+          <p v-if="detailsError" class="modal-error" role="alert">{{ detailsError }}</p>
+          <div v-if="!detailsLoading" class="recipe-details-body">
             <section class="ingredients-section" aria-labelledby="ingredients-heading">
               <p class="eyebrow">GET YOUR INGREDIENTS</p>
               <h3 id="ingredients-heading">What you’ll need</h3>
-              <ul class="ingredient-list">
+              <ul v-if="detailsRecipe.ingredients.length" class="ingredient-list">
                 <li v-for="(ingredient, index) in detailsRecipe.ingredients" :key="`${detailsRecipe.id}-ingredient-${index}`">
                   <span class="ingredient-check" aria-hidden="true"></span>
                   {{ ingredient }}
                 </li>
               </ul>
+              <p v-else class="details-unavailable">Ingredient details aren’t available.</p>
             </section>
             <section class="steps-section" aria-labelledby="steps-heading">
               <p class="eyebrow">A FEW SIMPLE STEPS</p>
               <h3 id="steps-heading">Let’s get cooking</h3>
-              <ol class="step-list">
+              <ol v-if="detailsRecipe.steps.length" class="step-list">
                 <li v-for="(step, index) in detailsRecipe.steps" :key="`${detailsRecipe.id}-step-${index}`">
                   <span class="step-number">{{ String(index + 1).padStart(2, '0') }}</span>
                   <p>{{ step }}</p>
                 </li>
               </ol>
+              <p v-else class="details-unavailable">Cooking instructions aren’t available.</p>
             </section>
           </div>
         </section>
