@@ -4,9 +4,7 @@ A frontend-only recipe discovery app built with Vue 3 and Vite. Find a meal by k
 
 ## Live app
 
-The app is hosted on Netlify: `https://<your-site-name>.netlify.app`
-
-Replace this placeholder with the app's Netlify URL after deployment.
+The app is hosted on Netlify: `https://random-meal-generator-andres-orozco.netlify.app`
 
 ## Run locally
 
